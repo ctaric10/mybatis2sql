@@ -125,3 +125,8 @@ java -Dmybatis2sql.maxVariants=50000 MybatisXmlToSql
 ```
 
 如需参与改进，请先阅读[贡献指南](CONTRIBUTING.md)。
+
+## 开源许可证
+
+本项目采用 [MIT License](LICENSE) 开源。你可以自由使用、复制、修改和分发，但需
+保留原始版权与许可声明。
