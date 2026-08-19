@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        java: [8, 17, 21]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - name: Compile
+        run: |
+          mkdir -p build/classes
+          javac -encoding UTF-8 -d build/classes MybatisXmlToSql.java MybatisXmlToSqlTest.java
+      - name: Run regression tests
+        run: java -cp build/classes MybatisXmlToSqlTest

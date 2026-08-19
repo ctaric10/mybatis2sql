@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<mapper namespace="xxx.yyy.aaa.ccc">
+    <sql id="nameColumn">${alias}.name</sql>
+
+    <sql id="bb">
+        id, <include refid="nameColumn"/>, ${alias}.status
+    </sql>
+</mapper>

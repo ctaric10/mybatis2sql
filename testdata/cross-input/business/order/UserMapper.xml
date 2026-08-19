@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<mapper namespace="demo.order.UserMapper">
+    <select id="findUser">
+        SELECT
+        <include refid="xxx.yyy.aaa.ccc.bb">
+            <property name="alias" value="u"/>
+        </include>
+        FROM users u
+        WHERE u.id = #{id}
+    </select>
+</mapper>

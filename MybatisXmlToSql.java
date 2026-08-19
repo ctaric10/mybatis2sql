@@ -1,0 +1,769 @@
+import org.w3c.dom.CDATASection;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.Node;
+import org.w3c.dom.NodeList;
+import org.xml.sax.InputSource;
+
+import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.DocumentBuilderFactory;
+import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+/**
+ * 从 MyBatis Mapper XML 中提取所有可能的结构化 SQL 分支。
+ *
+ * <p>程序只使用 JDK 标准库，无需引入 MyBatis 或其他第三方依赖。编译运行方式：</p>
+ * <pre>
+ *   javac MybatisXmlToSql.java
+ *   java MybatisXmlToSql
+ * </pre>
+ */
+public final class MybatisXmlToSql {
+    /** 防止多个动态标签进行笛卡尔积时产生过多 SQL 变体。 */
+    private static final int MAX_VARIANTS =
+            Integer.getInteger("mybatis2sql.maxVariants", 10_000);
+
+    /** 匹配最终仍未被 include property 替换的 #{...} 和 ${...} 占位符。 */
+    private static final Pattern MYBATIS_PLACEHOLDER =
+            Pattern.compile("[#$]\\{[^{}]*}");
+
+    private MybatisXmlToSql() {
+    }
+
+    public static void main(String[] args) throws Exception {
+        // 修改下面两个变量以指定输入文件/目录和输出文件/目录。
+        String inputPath = "testdata/input";
+        String outputPath = "testdata/output";
+
+        convert(Paths.get(inputPath), Paths.get(outputPath));
+    }
+
+    /**
+     * 将一个 Mapper XML 或 Mapper 目录转换到指定输出位置。
+     *
+     * <p>目录输入会先递归索引目录下所有 Mapper 的 {@code namespace.id}，因此
+     * 引用方和片段定义方可以位于不同子目录，XML 文件名也不需要与 namespace
+     * 的任何部分相同。</p>
+     */
+    public static void convert(Path inputPath, Path outputPath) throws Exception {
+        if (inputPath == null || outputPath == null) {
+            throw new IllegalArgumentException("Input and output paths must not be null");
+        }
+
+        Path input = inputPath.toAbsolutePath().normalize();
+        if (!Files.exists(input)) {
+            throw new IllegalArgumentException("Input does not exist: " + input);
+        }
+
+        boolean singleFile = Files.isRegularFile(input);
+        if (singleFile && !isXml(input)) {
+            throw new IllegalArgumentException("Input file must end with .xml: " + input);
+        }
+        Path output = outputPath.toAbsolutePath().normalize();
+
+        // 必须先加载输入范围内的全部 Mapper 并建立全局片段索引，
+        // 否则当前 Mapper 无法解析指向其他 namespace 的 <include>。
+        List<Path> xmlFiles = discoverXmlFiles(input, singleFile);
+        List<MapperDocument> mappers = loadMappers(xmlFiles);
+        FragmentRegistry fragments = new FragmentRegistry();
+        for (MapperDocument mapper : mappers) {
+            fragments.registerAll(mapper);
+        }
+
+        if (singleFile) {
+            // 单文件模式仍会扫描父目录树来解析外部片段，但只输出用户指定的 Mapper。
+            MapperDocument requested = findMapper(mappers, input);
+            if (requested == null) {
+                System.out.println("Skip non-Mapper XML: " + input);
+                return;
+            }
+            Path outputFile = output.toString().toLowerCase(Locale.ROOT).endsWith(".sql")
+                    ? output
+                    : output.resolve(sqlFileName(input));
+            extractOne(requested, outputFile, fragments);
+            return;
+        }
+
+        final Path outputRoot = output;
+        int count = 0;
+        for (MapperDocument mapper : mappers) {
+            // 目录模式保留源文件相对于输入根目录的层级结构。
+            Path relative = input.relativize(mapper.path);
+            Path target = outputRoot.resolve(relative);
+            target = target.resolveSibling(sqlFileName(target));
+            if (extractOne(mapper, target, fragments)) {
+                count++;
+            }
+        }
+        System.out.println("Done. Generated " + count + " SQL file(s) under " + outputRoot);
+    }
+
+    /**
+     * 确定本次解析需要索引的 XML 文件。
+     * 单文件输入使用其父目录作为搜索根目录，目录输入则直接递归扫描该目录。
+     */
+    private static List<Path> discoverXmlFiles(Path input, boolean singleFile) throws Exception {
+        Path searchRoot = singleFile ? input.getParent() : input;
+        if (searchRoot == null) {
+            searchRoot = input.toAbsolutePath().getParent();
+        }
+        List<Path> xmlFiles = new ArrayList<Path>();
+        try (Stream<Path> paths = Files.walk(searchRoot)) {
+            paths.filter(Files::isRegularFile)
+                    .filter(MybatisXmlToSql::isXml)
+                    .map(path -> path.toAbsolutePath().normalize())
+                    .sorted()
+                    .forEach(xmlFiles::add);
+        }
+        return xmlFiles;
+    }
+
+    /** 解析 XML，并只保留根节点为 mapper 的文档。 */
+    private static List<MapperDocument> loadMappers(List<Path> xmlFiles) throws Exception {
+        List<MapperDocument> mappers = new ArrayList<MapperDocument>();
+        for (Path xml : xmlFiles) {
+            Document document = parseXml(xml);
+            Element mapper = document.getDocumentElement();
+            if (mapper != null && "mapper".equalsIgnoreCase(tagName(mapper))) {
+                mappers.add(new MapperDocument(xml, mapper, mapper.getAttribute("namespace")));
+            }
+        }
+        return mappers;
+    }
+
+    /** 从已加载的 Mapper 中找到单文件模式指定的那一个。 */
+    private static MapperDocument findMapper(List<MapperDocument> mappers, Path path) {
+        Path requested = path.toAbsolutePath().normalize();
+        for (MapperDocument mapper : mappers) {
+            if (mapper.path.equals(requested)) {
+                return mapper;
+            }
+        }
+        return null;
+    }
+
+    private static boolean isXml(Path path) {
+        return path.getFileName().toString().toLowerCase(Locale.ROOT).endsWith(".xml");
+    }
+
+    private static String sqlFileName(Path path) {
+        String name = path.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        return (dot < 0 ? name : name.substring(0, dot)) + ".sql";
+    }
+
+    /**
+     * 渲染一个 Mapper 中的全部增删改查语句，并写入对应 SQL 文件。
+     * 返回 false 表示该 XML 只有片段定义，没有可输出的 SQL 语句。
+     */
+    private static boolean extractOne(MapperDocument mapperDocument, Path output,
+                                      FragmentRegistry fragments) throws Exception {
+        Path xml = mapperDocument.path;
+        Element mapper = mapperDocument.mapper;
+        Renderer renderer = new Renderer(fragments, mapperDocument.namespace);
+        StringBuilder result = new StringBuilder();
+        result.append("-- Generated from: ").append(xml.getFileName()).append('\n');
+        result.append("-- foreach variants: one item, two items; empty output is omitted.\n\n");
+
+        int statementCount = 0;
+        NodeList children = mapper.getChildNodes();
+        for (int i = 0; i < children.getLength(); i++) {
+            Node child = children.item(i);
+            if (!(child instanceof Element) || !isStatement((Element) child)) {
+                continue;
+            }
+            Element statement = (Element) child;
+            List<Variant> rendered = renderer.renderChildren(statement, Collections.<String, String>emptyMap());
+
+            // 不同动态分支可能生成完全相同的 SQL，这里按规范化后的 SQL 去重，
+            // LinkedHashMap 同时保证输出顺序稳定。
+            LinkedHashMap<String, Variant> unique = new LinkedHashMap<String, Variant>();
+            for (Variant variant : rendered) {
+                String sql = normalizeSql(variant.text);
+                if (!sql.isEmpty() && !unique.containsKey(sql)) {
+                    unique.put(sql, new Variant(sql, variant.decisions));
+                }
+            }
+            writeStatement(result, statement, unique);
+            statementCount++;
+        }
+
+        if (statementCount == 0) {
+            System.out.println("Skip XML without SQL statements: " + xml);
+            return false;
+        }
+        Path parent = output.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.write(output, result.toString().getBytes(StandardCharsets.UTF_8));
+        System.out.println("Generated: " + output + " (" + statementCount + " statement(s))");
+        return true;
+    }
+
+    /**
+     * 使用关闭外部实体和外部 DTD 的 DOM 解析器读取 Mapper，避免网络访问和 XXE。
+     */
+    private static Document parseXml(Path xml) throws Exception {
+        DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+        factory.setNamespaceAware(false);
+        factory.setXIncludeAware(false);
+        factory.setExpandEntityReferences(false);
+        setFeature(factory, XMLConstants.FEATURE_SECURE_PROCESSING, true);
+        setFeature(factory, "http://xml.org/sax/features/external-general-entities", false);
+        setFeature(factory, "http://xml.org/sax/features/external-parameter-entities", false);
+        setFeature(factory, "http://apache.org/xml/features/nonvalidating/load-external-dtd", false);
+        try {
+            factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_DTD, "");
+            factory.setAttribute(XMLConstants.ACCESS_EXTERNAL_SCHEMA, "");
+        } catch (IllegalArgumentException ignored) {
+            // 某些旧版 JDK 不支持这些属性，上面设置的 SAX feature 仍会阻止外部资源加载。
+        }
+        DocumentBuilder builder = factory.newDocumentBuilder();
+        builder.setEntityResolver((publicId, systemId) -> new InputSource(new StringReader("")));
+        return builder.parse(xml.toFile());
+    }
+
+    /** 兼容不支持特定 XML feature 的 JDK 实现。 */
+    private static void setFeature(DocumentBuilderFactory factory, String feature, boolean value) {
+        try {
+            factory.setFeature(feature, value);
+        } catch (Exception ignored) {
+            // 忽略不支持的 feature，保证在不同 JDK XML 解析器上仍可运行。
+        }
+    }
+
+    private static boolean isStatement(Element element) {
+        String name = tagName(element).toLowerCase(Locale.ROOT);
+        return "select".equals(name) || "insert".equals(name)
+                || "update".equals(name) || "delete".equals(name);
+    }
+
+    private static String qualifiedFragmentId(String namespace, String id) {
+        return namespace == null || namespace.isEmpty() ? id : namespace + "." + id;
+    }
+
+    /** 将一条语句的所有变体及其分支选择信息写成可直接查看的 SQL 文本。 */
+    private static void writeStatement(StringBuilder output, Element statement,
+                                       LinkedHashMap<String, Variant> variants) {
+        String type = tagName(statement).toUpperCase(Locale.ROOT);
+        String id = statement.getAttribute("id");
+        output.append("-- ============================================================\n");
+        output.append("-- ").append(type).append(' ').append(id)
+                .append(" (variants: ").append(variants.size()).append(")\n");
+        output.append("-- ============================================================\n\n");
+        int number = 1;
+        for (Variant variant : variants.values()) {
+            String outputSql = replaceMyBatisPlaceholders(variant.text);
+            output.append("-- Variant ").append(number++).append('\n');
+            if (!variant.decisions.isEmpty()) {
+                output.append("-- Branches: ");
+                for (int i = 0; i < variant.decisions.size(); i++) {
+                    if (i > 0) {
+                        output.append(" | ");
+                    }
+                    output.append(safeComment(variant.decisions.get(i)));
+                }
+                output.append('\n');
+            }
+            output.append(outputSql);
+            if (!outputSql.endsWith(";")) {
+                output.append(';');
+            }
+            output.append("\n\n");
+        }
+    }
+
+    private static String safeComment(String value) {
+        return value.replace('\r', ' ').replace('\n', ' ').replace("--", "-");
+    }
+
+    private static String normalizeSql(String sql) {
+        return sql == null ? "" : sql.replaceAll("\\s+", " ").trim();
+    }
+
+    private static String replaceMyBatisPlaceholders(String sql) {
+        return MYBATIS_PLACEHOLDER.matcher(sql).replaceAll("'?'");
+    }
+
+    private static String tagName(Element element) {
+        String name = element.getTagName();
+        int colon = name.indexOf(':');
+        return colon < 0 ? name : name.substring(colon + 1);
+    }
+
+    /**
+     * 将 DOM 节点渲染成 SQL 变体列表。
+     * 每个 Variant 同时保存 SQL 文本以及生成该文本时选择的动态分支。
+     */
+    private static final class Renderer {
+        private final FragmentRegistry fragments;
+        private final String rootNamespace;
+
+        /** 保存正在展开的全限定片段 ID，用于检测本地或跨文档循环引用。 */
+        private final Deque<String> includeStack = new ArrayDeque<String>();
+
+        /** 保存当前外部片段上下文，使嵌套的无前缀 refid 按片段所属 namespace 解析。 */
+        private final Deque<Fragment> fragmentStack = new ArrayDeque<Fragment>();
+
+        private Renderer(FragmentRegistry fragments, String namespace) {
+            this.fragments = fragments;
+            this.rootNamespace = namespace;
+        }
+
+        /**
+         * 按 XML 中的先后顺序渲染所有子节点。
+         * 每加入一个节点，都将已有结果与该节点的结果做笛卡尔积组合。
+         */
+        private List<Variant> renderChildren(Node parent, Map<String, String> properties) {
+            List<Variant> result = singleton("");
+            NodeList children = parent.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                List<Variant> next = renderNode(children.item(i), properties);
+                result = combine(result, next);
+            }
+            return result;
+        }
+
+        /** 根据 MyBatis 动态标签类型分派到相应的渲染方法。 */
+        private List<Variant> renderNode(Node node, Map<String, String> properties) {
+            if (node.getNodeType() == Node.TEXT_NODE || node instanceof CDATASection) {
+                return singleton(substitute(node.getNodeValue(), properties));
+            }
+            if (!(node instanceof Element)) {
+                return singleton("");
+            }
+
+            Element element = (Element) node;
+            String name = tagName(element).toLowerCase(Locale.ROOT);
+            if ("if".equals(name) || "when".equals(name)) {
+                return renderIf(element, properties, name);
+            }
+            if ("choose".equals(name)) {
+                return renderChoose(element, properties);
+            }
+            if ("where".equals(name)) {
+                return wrapTrim(renderChildren(element, properties), "WHERE", "", "AND|OR", "");
+            }
+            if ("set".equals(name)) {
+                return wrapTrim(renderChildren(element, properties), "SET", "", "", ",");
+            }
+            if ("trim".equals(name)) {
+                return wrapTrim(renderChildren(element, properties),
+                        attr(element, "prefix", properties), attr(element, "suffix", properties),
+                        attr(element, "prefixOverrides", properties),
+                        attr(element, "suffixOverrides", properties));
+            }
+            if ("foreach".equals(name)) {
+                return renderForeach(element, properties);
+            }
+            if ("include".equals(name)) {
+                return renderInclude(element, properties);
+            }
+            if ("bind".equals(name)) {
+                return singleton("");
+            }
+            return renderChildren(element, properties);
+        }
+
+        /** `if`/`when` 同时生成“不包含内容”和“包含内容”两组结构分支。 */
+        private List<Variant> renderIf(Element element, Map<String, String> properties, String label) {
+            String test = attr(element, "test", properties);
+            List<Variant> result = new ArrayList<Variant>();
+            result.add(new Variant("", Collections.singletonList(label + "(" + test + ")=false")));
+            for (Variant included : renderChildren(element, properties)) {
+                result.add(included.withDecision(label + "(" + test + ")=true"));
+            }
+            checkLimit(result.size());
+            return result;
+        }
+
+        /**
+         * 为 choose 的每个 when 以及 otherwise 分别生成结果；
+         * 没有 otherwise 时额外保留一个所有条件均不匹配的空分支。
+         */
+        private List<Variant> renderChoose(Element choose, Map<String, String> properties) {
+            List<Variant> result = new ArrayList<Variant>();
+            boolean hasOtherwise = false;
+            NodeList children = choose.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node child = children.item(i);
+                if (!(child instanceof Element)) {
+                    continue;
+                }
+                Element option = (Element) child;
+                String optionName = tagName(option).toLowerCase(Locale.ROOT);
+                if ("when".equals(optionName)) {
+                    String test = attr(option, "test", properties);
+                    for (Variant variant : renderChildren(option, properties)) {
+                        result.add(variant.withDecision("choose when(" + test + ")"));
+                    }
+                } else if ("otherwise".equals(optionName)) {
+                    hasOtherwise = true;
+                    for (Variant variant : renderChildren(option, properties)) {
+                        result.add(variant.withDecision("choose otherwise"));
+                    }
+                }
+            }
+            if (!hasOtherwise) {
+                result.add(new Variant("", Collections.singletonList("choose no-match")));
+            }
+            checkLimit(result.size());
+            return result;
+        }
+
+        /**
+         * foreach 不尝试枚举任意集合长度，只生成一个元素和两个元素两种代表形式。
+         * 两元素形式还会组合两次循环体内部可能出现的不同动态分支。
+         */
+        private List<Variant> renderForeach(Element foreach, Map<String, String> properties) {
+            String collection = attr(foreach, "collection", properties);
+            String item = attr(foreach, "item", properties);
+            String index = attr(foreach, "index", properties);
+            String open = attr(foreach, "open", properties);
+            String close = attr(foreach, "close", properties);
+            String separator = attr(foreach, "separator", properties);
+            if (collection.isEmpty()) {
+                collection = "collection";
+            }
+            if (item.isEmpty()) {
+                item = "item";
+            }
+            if (index.isEmpty()) {
+                index = "index";
+            }
+
+            List<Variant> result = new ArrayList<Variant>();
+            List<Variant> bodies = renderChildren(foreach, properties);
+            checkLimit(bodies.size() + (long) bodies.size() * bodies.size());
+
+            // 单元素代表形式：item/index 分别指向 collection[0] 和 0。
+            for (Variant body : bodies) {
+                String one = replaceLoopVariables(body.text, item, index,
+                        collection + "[0]", "0");
+                result.add(new Variant(join(open, join(one, close)), body.decisions)
+                        .withDecision("foreach(" + collection + ")=one"));
+            }
+
+            // 双元素代表形式：两个循环体独立选择动态分支，再用 separator 拼接。
+            for (Variant firstBody : bodies) {
+                for (Variant secondBody : bodies) {
+                    String first = replaceLoopVariables(firstBody.text, item, index,
+                            collection + "[0]", "0");
+                    String second = replaceLoopVariables(secondBody.text, item, index,
+                            collection + "[1]", "1");
+                    List<String> decisions = new ArrayList<String>();
+                    for (String decision : firstBody.decisions) {
+                        decisions.add("item[0] " + decision);
+                    }
+                    for (String decision : secondBody.decisions) {
+                        decisions.add("item[1] " + decision);
+                    }
+                    String two = joinWithSeparator(first, separator, second);
+                    result.add(new Variant(join(open, join(two, close)), decisions)
+                            .withDecision("foreach(" + collection + ")=two"));
+                }
+            }
+            checkLimit(result.size());
+            return result;
+        }
+
+        /**
+         * 展开 include：先合并 property，再按当前片段所属 namespace 解析 refid。
+         * 进入外部片段时将其压栈，从而让片段内部的无前缀 include 使用正确上下文。
+         */
+        private List<Variant> renderInclude(Element include, Map<String, String> properties) {
+            Map<String, String> includeProperties = new LinkedHashMap<String, String>(properties);
+            NodeList children = include.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node child = children.item(i);
+                if (child instanceof Element && "property".equalsIgnoreCase(tagName((Element) child))) {
+                    Element property = (Element) child;
+                    includeProperties.put(property.getAttribute("name"),
+                            substitute(property.getAttribute("value"), includeProperties));
+                }
+            }
+            String refid = attr(include, "refid", includeProperties);
+
+            // 语句直接引用时使用当前 Mapper namespace；嵌套引用时使用外部片段 namespace。
+            String activeNamespace = fragmentStack.isEmpty()
+                    ? rootNamespace : fragmentStack.peek().namespace;
+            Fragment fragment = fragments.resolve(refid, activeNamespace);
+            if (fragment == null) {
+                return singleton("/* unresolved include: " + safeComment(refid) + " */");
+            }
+
+            // 使用全限定 ID 检测，因此 A -> B -> A 这样的跨 Mapper 环也能被识别。
+            if (includeStack.contains(fragment.qualifiedId)) {
+                throw new IllegalArgumentException("Cyclic <include>: " + includeStack
+                        + " -> " + fragment.qualifiedId);
+            }
+            includeStack.push(fragment.qualifiedId);
+            fragmentStack.push(fragment);
+            try {
+                return renderChildren(fragment.element, includeProperties);
+            } finally {
+                fragmentStack.pop();
+                includeStack.pop();
+            }
+        }
+
+        /** 实现 where、set 和 trim 共用的前后缀添加及覆盖词移除规则。 */
+        private static List<Variant> wrapTrim(List<Variant> variants, String prefix, String suffix,
+                                              String prefixOverrides, String suffixOverrides) {
+            List<Variant> result = new ArrayList<Variant>();
+            for (Variant variant : variants) {
+                String text = normalizeSql(variant.text);
+                text = removePrefix(text, prefixOverrides);
+                text = removeSuffix(text, suffixOverrides);
+                if (!text.isEmpty()) {
+                    text = join(prefix, join(text, suffix));
+                }
+                result.add(new Variant(text, variant.decisions));
+            }
+            return result;
+        }
+
+        private static String removePrefix(String text, String overrides) {
+            for (String token : splitOverrides(overrides)) {
+                Pattern pattern = Pattern.compile("^(?i:" + Pattern.quote(token) + ")(?:\\s+|$)");
+                Matcher matcher = pattern.matcher(text);
+                if (matcher.find()) {
+                    return text.substring(matcher.end()).trim();
+                }
+            }
+            return text;
+        }
+
+        private static String removeSuffix(String text, String overrides) {
+            for (String token : splitOverrides(overrides)) {
+                Pattern pattern = Pattern.compile("(?:\\s+|^)(?i:" + Pattern.quote(token) + ")$");
+                Matcher matcher = pattern.matcher(text);
+                if (matcher.find()) {
+                    return text.substring(0, matcher.start()).trim();
+                }
+                if (text.toLowerCase(Locale.ROOT).endsWith(token.toLowerCase(Locale.ROOT))) {
+                    return text.substring(0, text.length() - token.length()).trim();
+                }
+            }
+            return text;
+        }
+
+        private static List<String> splitOverrides(String value) {
+            if (value == null || value.trim().isEmpty()) {
+                return Collections.emptyList();
+            }
+            List<String> result = new ArrayList<String>();
+            for (String token : value.split("\\|")) {
+                if (!token.trim().isEmpty()) {
+                    result.add(token.trim());
+                }
+            }
+            return result;
+        }
+
+        private static String replaceLoopVariables(String text, String item, String index,
+                                                   String itemReplacement, String indexReplacement) {
+            String result = replacePlaceholderVariable(text, item, itemReplacement);
+            return replacePlaceholderVariable(result, index, indexReplacement);
+        }
+
+        private static String joinWithSeparator(String first, String separator, String second) {
+            String left = normalizeSql(first);
+            String right = normalizeSql(second);
+            if (left.isEmpty()) {
+                return right;
+            }
+            if (right.isEmpty()) {
+                return left;
+            }
+            if (separator == null || separator.isEmpty()) {
+                return left + " " + right;
+            }
+            return left + separator + " " + right;
+        }
+
+        private static String replacePlaceholderVariable(String text, String variable,
+                                                         String replacement) {
+            // 只替换占位符表达式开头的变量，避免把名称相似的普通文本误替换。
+            Pattern pattern = Pattern.compile("([#$])\\{\\s*" + Pattern.quote(variable)
+                    + "(?=\\.|\\s*[,}])");
+            Matcher matcher = pattern.matcher(text);
+            StringBuffer output = new StringBuffer();
+            while (matcher.find()) {
+                matcher.appendReplacement(output, Matcher.quoteReplacement(
+                        matcher.group(1) + "{" + replacement));
+            }
+            matcher.appendTail(output);
+            return output.toString();
+        }
+
+        private static String attr(Element element, String name, Map<String, String> properties) {
+            return substitute(element.getAttribute(name), properties);
+        }
+
+        private static String substitute(String text, Map<String, String> properties) {
+            String result = text == null ? "" : text;
+            for (Map.Entry<String, String> property : properties.entrySet()) {
+                result = result.replace("${" + property.getKey() + "}", property.getValue());
+            }
+            return result;
+        }
+
+        /**
+         * 将相邻节点的变体做笛卡尔积，并合并两侧的 SQL 文本和分支说明。
+         */
+        private static List<Variant> combine(List<Variant> left, List<Variant> right) {
+            long size = (long) left.size() * (long) right.size();
+            checkLimit(size);
+            List<Variant> result = new ArrayList<Variant>((int) size);
+            for (Variant first : left) {
+                for (Variant second : right) {
+                    List<String> decisions = new ArrayList<String>(
+                            first.decisions.size() + second.decisions.size());
+                    decisions.addAll(first.decisions);
+                    decisions.addAll(second.decisions);
+                    result.add(new Variant(join(first.text, second.text), decisions));
+                }
+            }
+            return result;
+        }
+
+        private static List<Variant> singleton(String text) {
+            return Collections.singletonList(new Variant(text, Collections.<String>emptyList()));
+        }
+
+        /** 在真正分配集合前检查上限，避免动态分支爆炸耗尽内存。 */
+        private static void checkLimit(long size) {
+            if (size > MAX_VARIANTS) {
+                throw new IllegalStateException("Dynamic SQL produced more than " + MAX_VARIANTS
+                        + " variants. Increase with -Dmybatis2sql.maxVariants=<number> if intentional.");
+            }
+        }
+
+        private static String join(String left, String right) {
+            String a = left == null ? "" : left.trim();
+            String b = right == null ? "" : right.trim();
+            if (a.isEmpty()) {
+                return b;
+            }
+            if (b.isEmpty()) {
+                return a;
+            }
+            return a + " " + b;
+        }
+    }
+
+    /**
+     * 全局 SQL 片段索引。键始终是 MyBatis 的全限定 ID（namespace.id），
+     * 以便不同 Mapper 之间的 include 与片段内部的本地 include 使用同一套解析规则。
+     */
+    private static final class FragmentRegistry {
+        private final Map<String, Fragment> fragments = new LinkedHashMap<String, Fragment>();
+
+        private void registerAll(MapperDocument mapperDocument) {
+            NodeList children = mapperDocument.mapper.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node child = children.item(i);
+                if (!(child instanceof Element)
+                        || !"sql".equalsIgnoreCase(tagName((Element) child))) {
+                    continue;
+                }
+
+                Element element = (Element) child;
+                String id = element.getAttribute("id").trim();
+                if (id.isEmpty()) {
+                    continue;
+                }
+                String qualifiedId = qualify(mapperDocument.namespace, id);
+                Fragment fragment = new Fragment(qualifiedId, mapperDocument.namespace,
+                        mapperDocument.path, element);
+                Fragment previous = fragments.get(qualifiedId);
+                if (previous != null) {
+                    throw new IllegalArgumentException("Duplicate SQL fragment '" + qualifiedId
+                            + "' in " + previous.sourcePath + " and " + mapperDocument.path);
+                }
+                fragments.put(qualifiedId, fragment);
+            }
+        }
+
+        private Fragment resolve(String refid, String activeNamespace) {
+            String candidate = refid == null ? "" : refid.trim();
+            if (candidate.isEmpty()) {
+                return null;
+            }
+
+            Fragment local = fragments.get(qualify(activeNamespace, candidate));
+            if (local != null) {
+                return local;
+            }
+            return fragments.get(candidate);
+        }
+
+        private static String qualify(String namespace, String id) {
+            String owner = namespace == null ? "" : namespace.trim();
+            return owner.isEmpty() ? id : owner + "." + id;
+        }
+    }
+
+    /** 一个 SQL 片段及其声明位置；namespace 用于解析片段内部的本地 include。 */
+    private static final class Fragment {
+        private final String qualifiedId;
+        private final String namespace;
+        private final Path sourcePath;
+        private final Element element;
+
+        private Fragment(String qualifiedId, String namespace, Path sourcePath, Element element) {
+            this.qualifiedId = qualifiedId;
+            this.namespace = namespace == null ? "" : namespace;
+            this.sourcePath = sourcePath;
+            this.element = element;
+        }
+    }
+
+    /** 已解析的 Mapper 文档及其解析跨文档引用所需的元数据。 */
+    private static final class MapperDocument {
+        private final Path path;
+        private final Element mapper;
+        private final String namespace;
+
+        private MapperDocument(Path path, Element mapper, String namespace) {
+            this.path = path;
+            this.mapper = mapper;
+            this.namespace = namespace == null ? "" : namespace;
+        }
+    }
+
+    /** 一种 SQL 结构结果，以及生成它时经过的动态分支描述。 */
+    private static final class Variant {
+        private final String text;
+        private final List<String> decisions;
+
+        private Variant(String text, List<String> decisions) {
+            this.text = text == null ? "" : text;
+            this.decisions = Collections.unmodifiableList(new ArrayList<String>(decisions));
+        }
+
+        private Variant withDecision(String decision) {
+            List<String> result = new ArrayList<String>(decisions);
+            result.add(decision);
+            return new Variant(text, result);
+        }
+    }
+}
