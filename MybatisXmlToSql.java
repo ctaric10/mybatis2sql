@@ -191,18 +191,13 @@ public final class MybatisXmlToSql {
             List<Variant> rendered;
             Integer fallbackLimit = null;
             Map<String, String> noProperties = Collections.<String, String>emptyMap();
-            if (renderer.exceedsVariantLimit(statement, noProperties)) {
+            try {
+                // 组合时会同步相同 test 的状态，并在兼容结果真正超过上限时停止。
+                rendered = renderer.renderChildren(statement, noProperties);
+            } catch (VariantLimitExceededException exceeded) {
                 rendered = renderer.renderChildrenIndividually(
                         statement, noProperties);
-                fallbackLimit = renderer.maxVariants;
-            } else {
-                try {
-                    rendered = renderer.renderChildren(statement, noProperties);
-                } catch (VariantLimitExceededException exceeded) {
-                    // 计数与渲染逻辑未来扩展后若短暂不一致，仍从语句根节点安全降级。
-                    rendered = renderer.renderChildrenIndividually(statement, noProperties);
-                    fallbackLimit = exceeded.limit;
-                }
+                fallbackLimit = exceeded.limit;
             }
 
             // 不同动态分支可能生成完全相同的 SQL，这里按规范化后的 SQL 去重，
@@ -211,7 +206,8 @@ public final class MybatisXmlToSql {
             for (Variant variant : rendered) {
                 String sql = normalizeSql(variant.text);
                 if (!sql.isEmpty() && !unique.containsKey(sql)) {
-                    unique.put(sql, new Variant(sql, variant.decisions));
+                    unique.put(sql, new Variant(
+                            sql, variant.decisions, variant.conditionStates));
                 }
             }
             writeStatement(result, statement, unique, fallbackLimit);
@@ -313,6 +309,91 @@ public final class MybatisXmlToSql {
         return value.replace('\r', ' ').replace('\n', ' ').replace("--", "-");
     }
 
+    /**
+     * 删除 SQL 文本中的 {@code --} 行注释，但保留结束该注释的换行。
+     *
+     * <p>必须在文本节点参与动态标签拼接前调用；否则拼接时移除换行后，行注释可能
+     * 误吞后续节点。引号内的双减号以及块注释原样保留。</p>
+     */
+    private static String stripLineComments(String sql) {
+        if (sql == null || sql.indexOf("--") < 0) {
+            return sql == null ? "" : sql;
+        }
+
+        StringBuilder result = new StringBuilder(sql.length());
+        char quoteEnd = 0;
+        boolean blockComment = false;
+        int index = 0;
+        while (index < sql.length()) {
+            char current = sql.charAt(index);
+
+            if (blockComment) {
+                result.append(current);
+                index++;
+                if (current == '*' && index < sql.length() && sql.charAt(index) == '/') {
+                    result.append('/');
+                    index++;
+                    blockComment = false;
+                }
+                continue;
+            }
+
+            if (quoteEnd != 0) {
+                result.append(current);
+                index++;
+                if (current == '\\' && index < sql.length()) {
+                    result.append(sql.charAt(index++));
+                } else if (current == quoteEnd) {
+                    if (index < sql.length() && sql.charAt(index) == quoteEnd) {
+                        result.append(sql.charAt(index++));
+                    } else {
+                        quoteEnd = 0;
+                    }
+                }
+                continue;
+            }
+
+            if (current == '/' && index + 1 < sql.length()
+                    && sql.charAt(index + 1) == '*') {
+                result.append("/*");
+                index += 2;
+                blockComment = true;
+                continue;
+            }
+            if (current == '\'' || current == '"' || current == '`') {
+                result.append(current);
+                quoteEnd = current;
+                index++;
+                continue;
+            }
+            if (current == '-' && index + 1 < sql.length()
+                    && sql.charAt(index + 1) == '-') {
+                index += 2;
+                while (index < sql.length()) {
+                    char commentCharacter = sql.charAt(index);
+                    if (commentCharacter == '\r' || commentCharacter == '\n') {
+                        break;
+                    }
+                    index++;
+                }
+                if (index < sql.length()) {
+                    char lineBreak = sql.charAt(index++);
+                    result.append(lineBreak);
+                    if (lineBreak == '\r' && index < sql.length()
+                            && sql.charAt(index) == '\n') {
+                        result.append('\n');
+                        index++;
+                    }
+                }
+                continue;
+            }
+
+            result.append(current);
+            index++;
+        }
+        return result.toString();
+    }
+
     private static String normalizeSql(String sql) {
         return sql == null ? "" : sql.replaceAll("\\s+", " ").trim();
     }
@@ -352,109 +433,9 @@ public final class MybatisXmlToSql {
             this.maxVariants = configuredMaxVariants();
         }
 
-        /** 在创建任何变体对象前预判整条语句是否会超过枚举上限。 */
-        private boolean exceedsVariantLimit(Node statement, Map<String, String> properties) {
-            return countChildren(statement, properties) > maxVariants;
-        }
-
-        private long countChildren(Node parent, Map<String, String> properties) {
-            long count = 1L;
-            NodeList children = parent.getChildNodes();
-            for (int i = 0; i < children.getLength(); i++) {
-                count = cappedMultiply(count, countNode(children.item(i), properties));
-                if (count > maxVariants) {
-                    return count;
-                }
-            }
-            return count;
-        }
-
-        private long countNode(Node node, Map<String, String> properties) {
-            if (!(node instanceof Element)) {
-                return 1L;
-            }
-            Element element = (Element) node;
-            String name = tagName(element).toLowerCase(Locale.ROOT);
-            if ("if".equals(name) || "when".equals(name)) {
-                return cappedAdd(1L, countChildren(element, properties));
-            }
-            if ("choose".equals(name)) {
-                return countChoose(element, properties);
-            }
-            if ("foreach".equals(name)) {
-                long bodies = countChildren(element, properties);
-                return cappedAdd(bodies, cappedMultiply(bodies, bodies));
-            }
-            if ("include".equals(name)) {
-                return countInclude(element, properties);
-            }
-            if ("bind".equals(name)) {
-                return 1L;
-            }
-            return countChildren(element, properties);
-        }
-
-        private long countChoose(Element choose, Map<String, String> properties) {
-            long count = 0L;
-            boolean hasOtherwise = false;
-            NodeList children = choose.getChildNodes();
-            for (int i = 0; i < children.getLength(); i++) {
-                Node child = children.item(i);
-                if (!(child instanceof Element)) {
-                    continue;
-                }
-                Element option = (Element) child;
-                String name = tagName(option).toLowerCase(Locale.ROOT);
-                if ("when".equals(name) || "otherwise".equals(name)) {
-                    hasOtherwise = hasOtherwise || "otherwise".equals(name);
-                    count = cappedAdd(count, countChildren(option, properties));
-                    if (count > maxVariants) {
-                        return count;
-                    }
-                }
-            }
-            return hasOtherwise ? count : cappedAdd(count, 1L);
-        }
-
-        private long countInclude(Element include, Map<String, String> properties) {
-            Map<String, String> includeProperties = includeProperties(include, properties);
-            String refid = attr(include, "refid", includeProperties);
-            String activeNamespace = fragmentStack.isEmpty()
-                    ? rootNamespace : fragmentStack.peek().namespace;
-            Fragment fragment = fragments.resolve(refid, activeNamespace);
-            if (fragment == null) {
-                return 1L;
-            }
-            if (includeStack.contains(fragment.qualifiedId)) {
-                throw new IllegalArgumentException("Cyclic <include>: " + includeStack
-                        + " -> " + fragment.qualifiedId);
-            }
-            includeStack.push(fragment.qualifiedId);
-            fragmentStack.push(fragment);
-            try {
-                return countChildren(fragment.element, includeProperties);
-            } finally {
-                fragmentStack.pop();
-                includeStack.pop();
-            }
-        }
-
-        private long cappedAdd(long left, long right) {
-            long cap = (long) maxVariants + 1L;
-            return left >= cap - right ? cap : left + right;
-        }
-
-        private long cappedMultiply(long left, long right) {
-            long cap = (long) maxVariants + 1L;
-            if (left == 0L || right == 0L) {
-                return 0L;
-            }
-            return left >= (cap + right - 1L) / right ? cap : left * right;
-        }
-
         /**
          * 按 XML 中的先后顺序渲染所有子节点。
-         * 每加入一个节点，都将已有结果与该节点的结果做笛卡尔积组合。
+         * 每加入一个节点，都将已有结果与该节点的条件兼容结果做笛卡尔积组合。
          */
         private List<Variant> renderChildren(Node parent, Map<String, String> properties) {
             List<Variant> result = singleton("");
@@ -468,8 +449,8 @@ public final class MybatisXmlToSql {
 
         /**
          * 超过枚举上限后使用线性模式重新渲染整条语句。基线保存所有条件均不选时的
-         * 静态 SQL，每个 alternative 只替换一个条件分支；顺序节点之间只与对方基线
-         * 合并，因此不同条件不会再形成笛卡尔积。
+         * 静态 SQL，每个 alternative 只替换一个唯一条件分支；相同条件在不同区段的
+         * alternative 会彼此合并，不同条件之间不再形成笛卡尔积。
          */
         private List<Variant> renderChildrenIndividually(
                 Node parent, Map<String, String> properties) {
@@ -495,7 +476,7 @@ public final class MybatisXmlToSql {
                 Node node, Map<String, String> properties) {
             if (node.getNodeType() == Node.TEXT_NODE || node instanceof CDATASection) {
                 return IndividualVariants.baseline(
-                        variant(substitute(node.getNodeValue(), properties)));
+                        variant(substitute(stripLineComments(node.getNodeValue()), properties)));
             }
             if (!(node instanceof Element)) {
                 return IndividualVariants.baseline(variant(""));
@@ -539,7 +520,7 @@ public final class MybatisXmlToSql {
         /** 根据 MyBatis 动态标签类型分派到相应的渲染方法。 */
         private List<Variant> renderNode(Node node, Map<String, String> properties) {
             if (node.getNodeType() == Node.TEXT_NODE || node instanceof CDATASection) {
-                return singleton(substitute(node.getNodeValue(), properties));
+                return singleton(substitute(stripLineComments(node.getNodeValue()), properties));
             }
             if (!(node instanceof Element)) {
                 return singleton("");
@@ -580,27 +561,53 @@ public final class MybatisXmlToSql {
         /** `if`/`when` 同时生成“不包含内容”和“包含内容”两组结构分支。 */
         private List<Variant> renderIf(Element element, Map<String, String> properties, String label) {
             String test = attr(element, "test", properties);
+            String conditionKey = conditionKey(test);
             List<Variant> result = new ArrayList<Variant>();
-            result.add(new Variant("", Collections.singletonList(label + "(" + test + ")=false")));
+            result.add(new Variant("", Collections.singletonList(
+                    label + "(" + test + ")=false")).withCondition(conditionKey, false));
             for (Variant included : renderChildren(element, properties)) {
-                result.add(included.withDecision(label + "(" + test + ")=true"));
+                if (conditionCompatible(included, conditionKey, true)) {
+                    result.add(included.withDecision(label + "(" + test + ")=true")
+                            .withCondition(conditionKey, true));
+                }
             }
             checkLimit(result.size());
             return result;
         }
 
+        /** 空白差异不改变 OGNL test 的分组键；不尝试做表达式逻辑等价推导。 */
+        private static String conditionKey(String test) {
+            return normalizeSql(test);
+        }
+
         private IndividualVariants renderIfIndividually(
                 Element element, Map<String, String> properties, String label) {
             String test = attr(element, "test", properties);
+            String conditionKey = conditionKey(test);
             IndividualVariants body = renderIndividualChildren(element, properties);
             Variant baseline = new Variant("",
-                    Collections.singletonList(label + "(" + test + ")=false"));
+                    Collections.singletonList(label + "(" + test + ")=false"))
+                    .withCondition(conditionKey, false);
             List<Variant> alternatives = new ArrayList<Variant>();
-            alternatives.add(body.baseline.withDecision(label + "(" + test + ")=true"));
+            if (conditionCompatible(body.baseline, conditionKey, true)) {
+                alternatives.add(body.baseline.withDecision(
+                        label + "(" + test + ")=true")
+                        .withCondition(conditionKey, true));
+            }
             for (Variant alternative : body.alternatives) {
-                alternatives.add(alternative.withDecision(label + "(" + test + ")=true"));
+                if (conditionCompatible(alternative, conditionKey, true)) {
+                    alternatives.add(alternative.withDecision(
+                            label + "(" + test + ")=true")
+                            .withCondition(conditionKey, true));
+                }
             }
             return new IndividualVariants(baseline, alternatives);
+        }
+
+        private static boolean conditionCompatible(
+                Variant variant, String conditionKey, boolean selected) {
+            Boolean current = variant.conditionStates.get(conditionKey);
+            return current == null || current.booleanValue() == selected;
         }
 
         /**
@@ -690,31 +697,41 @@ public final class MybatisXmlToSql {
             List<Variant> result = new ArrayList<Variant>();
             List<Variant> bodies = renderChildren(foreach, properties);
             checkLimit(bodies.size() + (long) bodies.size() * bodies.size());
+            String conditionScope = "foreach@"
+                    + Integer.toHexString(System.identityHashCode(foreach)) + ":";
 
             // 单元素代表形式：item/index 分别指向 collection[0] 和 0。
             for (Variant body : bodies) {
-                String one = replaceLoopVariables(body.text, item, index,
+                Variant scopedBody = body.withConditionScope(conditionScope + "item[0]:");
+                String one = replaceLoopVariables(scopedBody.text, item, index,
                         collection + "[0]", "0");
-                result.add(new Variant(join(open, join(one, close)), body.decisions)
+                result.add(new Variant(join(open, join(one, close)), scopedBody.decisions,
+                        scopedBody.conditionStates)
                         .withDecision("foreach(" + collection + ")=one"));
             }
 
             // 双元素代表形式：两个循环体独立选择动态分支，再用 separator 拼接。
             for (Variant firstBody : bodies) {
                 for (Variant secondBody : bodies) {
-                    String first = replaceLoopVariables(firstBody.text, item, index,
+                    Variant scopedFirst = firstBody.withConditionScope(
+                            conditionScope + "item[0]:");
+                    Variant scopedSecond = secondBody.withConditionScope(
+                            conditionScope + "item[1]:");
+                    String first = replaceLoopVariables(scopedFirst.text, item, index,
                             collection + "[0]", "0");
-                    String second = replaceLoopVariables(secondBody.text, item, index,
+                    String second = replaceLoopVariables(scopedSecond.text, item, index,
                             collection + "[1]", "1");
                     List<String> decisions = new ArrayList<String>();
-                    for (String decision : firstBody.decisions) {
+                    for (String decision : scopedFirst.decisions) {
                         decisions.add("item[0] " + decision);
                     }
-                    for (String decision : secondBody.decisions) {
+                    for (String decision : scopedSecond.decisions) {
                         decisions.add("item[1] " + decision);
                     }
                     String two = joinWithSeparator(first, separator, second);
-                    result.add(new Variant(join(open, join(two, close)), decisions)
+                    result.add(new Variant(join(open, join(two, close)), decisions,
+                            mergeConditionStates(scopedFirst.conditionStates,
+                                    scopedSecond.conditionStates))
                             .withDecision("foreach(" + collection + ")=two"));
                 }
             }
@@ -742,34 +759,42 @@ public final class MybatisXmlToSql {
 
             IndividualVariants bodies = renderIndividualChildren(foreach, properties);
             List<Variant> alternatives = new ArrayList<Variant>();
+            String conditionScope = "foreach@"
+                    + Integer.toHexString(System.identityHashCode(foreach)) + ":";
             addIndividualForeachVariants(alternatives, bodies.baseline,
-                    collection, item, index, open, close, separator);
+                    collection, item, index, open, close, separator, conditionScope);
             for (Variant body : bodies.alternatives) {
                 addIndividualForeachVariants(alternatives, body,
-                        collection, item, index, open, close, separator);
+                        collection, item, index, open, close, separator, conditionScope);
             }
             return new IndividualVariants(variant(""), alternatives);
         }
 
         private static void addIndividualForeachVariants(
                 List<Variant> result, Variant body, String collection,
-                String item, String index, String open, String close, String separator) {
-            String first = replaceLoopVariables(body.text, item, index,
+                String item, String index, String open, String close, String separator,
+                String conditionScope) {
+            Variant scopedFirst = body.withConditionScope(conditionScope + "item[0]:");
+            String first = replaceLoopVariables(scopedFirst.text, item, index,
                     collection + "[0]", "0");
-            result.add(new Variant(join(open, join(first, close)), body.decisions)
+            result.add(new Variant(join(open, join(first, close)), scopedFirst.decisions,
+                    scopedFirst.conditionStates)
                     .withDecision("foreach(" + collection + ")=one"));
 
-            String second = replaceLoopVariables(body.text, item, index,
+            Variant scopedSecond = body.withConditionScope(conditionScope + "item[1]:");
+            String second = replaceLoopVariables(scopedSecond.text, item, index,
                     collection + "[1]", "1");
             List<String> decisions = new ArrayList<String>();
-            for (String decision : body.decisions) {
+            for (String decision : scopedFirst.decisions) {
                 decisions.add("item[0] " + decision);
             }
-            for (String decision : body.decisions) {
+            for (String decision : scopedSecond.decisions) {
                 decisions.add("item[1] " + decision);
             }
             String two = joinWithSeparator(first, separator, second);
-            result.add(new Variant(join(open, join(two, close)), decisions)
+            result.add(new Variant(join(open, join(two, close)), decisions,
+                    mergeConditionStates(scopedFirst.conditionStates,
+                            scopedSecond.conditionStates))
                     .withDecision("foreach(" + collection + ")=two"));
         }
 
@@ -856,7 +881,7 @@ public final class MybatisXmlToSql {
                 if (!text.isEmpty()) {
                     text = join(prefix, join(text, suffix));
                 }
-                result.add(new Variant(text, variant.decisions));
+                result.add(new Variant(text, variant.decisions, variant.conditionStates));
             }
             return result;
         }
@@ -883,7 +908,7 @@ public final class MybatisXmlToSql {
             if (!text.isEmpty()) {
                 text = join(prefix, join(text, suffix));
             }
-            return new Variant(text, variant.decisions);
+            return new Variant(text, variant.decisions, variant.conditionStates);
         }
 
         private static String removePrefix(String text, String overrides) {
@@ -976,18 +1001,41 @@ public final class MybatisXmlToSql {
          * 将相邻节点的变体做笛卡尔积，并合并两侧的 SQL 文本和分支说明。
          */
         private List<Variant> combine(List<Variant> left, List<Variant> right) {
-            long size = (long) left.size() * (long) right.size();
-            checkLimit(size);
-            List<Variant> result = new ArrayList<Variant>((int) size);
+            List<Variant> result = new ArrayList<Variant>();
             for (Variant first : left) {
                 for (Variant second : right) {
+                    if (!conditionsCompatible(first.conditionStates, second.conditionStates)) {
+                        continue;
+                    }
                     List<String> decisions = new ArrayList<String>(
                             first.decisions.size() + second.decisions.size());
                     decisions.addAll(first.decisions);
                     decisions.addAll(second.decisions);
-                    result.add(new Variant(join(first.text, second.text), decisions));
+                    result.add(new Variant(join(first.text, second.text), decisions,
+                            mergeConditionStates(first.conditionStates,
+                                    second.conditionStates)));
+                    checkLimit(result.size());
                 }
             }
+            return result;
+        }
+
+        private static boolean conditionsCompatible(
+                Map<String, Boolean> left, Map<String, Boolean> right) {
+            for (Map.Entry<String, Boolean> entry : left.entrySet()) {
+                Boolean other = right.get(entry.getKey());
+                if (other != null && !other.equals(entry.getValue())) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private static LinkedHashMap<String, Boolean> mergeConditionStates(
+                Map<String, Boolean> left, Map<String, Boolean> right) {
+            LinkedHashMap<String, Boolean> result =
+                    new LinkedHashMap<String, Boolean>(left);
+            result.putAll(right);
             return result;
         }
 
@@ -996,21 +1044,62 @@ public final class MybatisXmlToSql {
             Variant baseline = combineVariants(left.baseline, right.baseline);
             List<Variant> alternatives = new ArrayList<Variant>(
                     left.alternatives.size() + right.alternatives.size());
-            for (Variant alternative : left.alternatives) {
-                alternatives.add(combineVariants(alternative, right.baseline));
+            boolean[] matchedRight = new boolean[right.alternatives.size()];
+            for (Variant leftAlternative : left.alternatives) {
+                boolean matched = false;
+                for (int index = 0; index < right.alternatives.size(); index++) {
+                    Variant rightAlternative = right.alternatives.get(index);
+                    if (sameSelectedConditions(leftAlternative, rightAlternative)) {
+                        alternatives.add(combineVariants(
+                                leftAlternative, rightAlternative));
+                        matchedRight[index] = true;
+                        matched = true;
+                    }
+                }
+                if (!matched && conditionsCompatible(leftAlternative.conditionStates,
+                        right.baseline.conditionStates)) {
+                    alternatives.add(combineVariants(leftAlternative, right.baseline));
+                }
             }
-            for (Variant alternative : right.alternatives) {
-                alternatives.add(combineVariants(left.baseline, alternative));
+            for (int index = 0; index < right.alternatives.size(); index++) {
+                Variant rightAlternative = right.alternatives.get(index);
+                if (!matchedRight[index] && conditionsCompatible(
+                        left.baseline.conditionStates, rightAlternative.conditionStates)) {
+                    alternatives.add(combineVariants(left.baseline, rightAlternative));
+                }
             }
             return new IndividualVariants(baseline, alternatives);
         }
 
+        /** 线性降级中，选择了同一组 if 条件的两段 SQL 必须一起进入结果。 */
+        private static boolean sameSelectedConditions(Variant left, Variant right) {
+            List<String> leftSelected = selectedConditions(left);
+            return !leftSelected.isEmpty()
+                    && leftSelected.equals(selectedConditions(right));
+        }
+
+        private static List<String> selectedConditions(Variant variant) {
+            List<String> result = new ArrayList<String>();
+            for (Map.Entry<String, Boolean> entry : variant.conditionStates.entrySet()) {
+                if (Boolean.TRUE.equals(entry.getValue())) {
+                    result.add(entry.getKey());
+                }
+            }
+            Collections.sort(result);
+            return result;
+        }
+
         private static Variant combineVariants(Variant first, Variant second) {
+            if (!conditionsCompatible(first.conditionStates, second.conditionStates)) {
+                throw new IllegalStateException(
+                        "Cannot combine contradictory correlated condition states");
+            }
             List<String> decisions = new ArrayList<String>(
                     first.decisions.size() + second.decisions.size());
             decisions.addAll(first.decisions);
             decisions.addAll(second.decisions);
-            return new Variant(join(first.text, second.text), decisions);
+            return new Variant(join(first.text, second.text), decisions,
+                    mergeConditionStates(first.conditionStates, second.conditionStates));
         }
 
         private static Variant variant(String text) {
@@ -1152,16 +1241,46 @@ public final class MybatisXmlToSql {
     private static final class Variant {
         private final String text;
         private final List<String> decisions;
+        private final Map<String, Boolean> conditionStates;
 
         private Variant(String text, List<String> decisions) {
+            this(text, decisions, Collections.<String, Boolean>emptyMap());
+        }
+
+        private Variant(String text, List<String> decisions,
+                        Map<String, Boolean> conditionStates) {
             this.text = text == null ? "" : text;
             this.decisions = Collections.unmodifiableList(new ArrayList<String>(decisions));
+            this.conditionStates = Collections.unmodifiableMap(
+                    new LinkedHashMap<String, Boolean>(conditionStates));
         }
 
         private Variant withDecision(String decision) {
             List<String> result = new ArrayList<String>(decisions);
             result.add(decision);
-            return new Variant(text, result);
+            return new Variant(text, result, conditionStates);
+        }
+
+        private Variant withCondition(String conditionKey, boolean selected) {
+            LinkedHashMap<String, Boolean> result =
+                    new LinkedHashMap<String, Boolean>(conditionStates);
+            Boolean previous = result.put(conditionKey, selected);
+            if (previous != null && previous.booleanValue() != selected) {
+                throw new IllegalStateException(
+                        "Contradictory state for correlated condition: " + conditionKey);
+            }
+            return new Variant(text, decisions, result);
+        }
+
+        private Variant withConditionScope(String scope) {
+            if (conditionStates.isEmpty()) {
+                return this;
+            }
+            LinkedHashMap<String, Boolean> result = new LinkedHashMap<String, Boolean>();
+            for (Map.Entry<String, Boolean> entry : conditionStates.entrySet()) {
+                result.put(scope + entry.getKey(), entry.getValue());
+            }
+            return new Variant(text, decisions, result);
         }
     }
 }

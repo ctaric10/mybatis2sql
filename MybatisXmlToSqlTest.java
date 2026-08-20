@@ -29,6 +29,9 @@ public final class MybatisXmlToSqlTest {
             assertDuplicateFragmentRejected(temporaryOutput);
             assertCyclicIncludeRejected(temporaryOutput);
             assertVariantLimitFallsBackToIndividualConditions(temporaryOutput);
+            assertRepeatedIfTestsShareOneDecision(temporaryOutput);
+            assertRepeatedIfTestsStayPairedDuringFallback(temporaryOutput);
+            assertSqlLineCommentsRemoved(temporaryOutput);
 
             System.out.println("All MybatisXmlToSql regression tests passed.");
         } finally {
@@ -135,6 +138,128 @@ public final class MybatisXmlToSqlTest {
                         && !sql.contains("status = '?' AND")
                         && !sql.contains("type = '?' AND"),
                 "individual conditions were still combined");
+    }
+
+    private static void assertRepeatedIfTestsShareOneDecision(
+            Path temporaryOutput) throws Exception {
+        Path input = temporaryOutput.resolve("correlated-input");
+        Path output = temporaryOutput.resolve("correlated-output");
+        Files.createDirectories(input);
+        writeUtf8(input.resolve("AuthorityMapper.xml"),
+                "<mapper namespace=\"test.authority\">"
+                        + "<insert id=\"createAuthority\">INSERT INTO authority "
+                        + "<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">"
+                        + "<if test=\"participantID != null\">participant_id,</if>"
+                        + "<if test=\"agencyID != null\">agency_id,</if>"
+                        + "</trim>"
+                        + "<trim prefix=\"VALUES (\" suffix=\")\" suffixOverrides=\",\">"
+                        + "<if test=\"  participantID   !=   null  \">#{participantID},</if>"
+                        + "<if test=\"agencyID != null\">#{agencyID},</if>"
+                        + "</trim>"
+                        + "</insert>"
+                        + "</mapper>");
+
+        MybatisXmlToSql.convert(input, output);
+
+        String sql = normalizeNewlines(Files.readAllBytes(output.resolve("AuthorityMapper.sql")));
+        assertTrue(sql.contains("createAuthority (variants: 4)"),
+                "repeated tests were enumerated as independent conditions");
+        assertTrue(sql.contains("( participant_id ) VALUES ( '?' )"),
+                "participant column and value were not selected together");
+        assertTrue(sql.contains("( agency_id ) VALUES ( '?' )"),
+                "agency column and value were not selected together");
+        assertTrue(sql.contains("( participant_id, agency_id ) VALUES ( '?', '?' )"),
+                "combined columns and values were not selected together");
+        assertTrue(!sql.contains("( participant_id ) VALUES ( '?', '?' )")
+                        && !sql.contains("( agency_id ) VALUES ( '?', '?' )")
+                        && !sql.contains("( participant_id, agency_id ) VALUES ( '?' )"),
+                "an impossible column/value combination was generated");
+    }
+
+    private static void assertRepeatedIfTestsStayPairedDuringFallback(
+            Path temporaryOutput) throws Exception {
+        Path input = temporaryOutput.resolve("correlated-limit-input");
+        Path output = temporaryOutput.resolve("correlated-limit-output");
+        Files.createDirectories(input);
+        writeUtf8(input.resolve("AuthorityMapper.xml"),
+                "<mapper namespace=\"test.authority.limit\">"
+                        + "<insert id=\"createAuthority\">INSERT INTO authority "
+                        + "<trim prefix=\"(\" suffix=\")\" suffixOverrides=\",\">"
+                        + "<if test=\"participantID != null\">participant_id,</if>"
+                        + "<if test=\"agencyID != null\">agency_id,</if>"
+                        + "<if test=\"marketID != null\">market_id,</if>"
+                        + "</trim>"
+                        + "<trim prefix=\"VALUES (\" suffix=\")\" suffixOverrides=\",\">"
+                        + "<if test=\"participantID != null\">#{participantID},</if>"
+                        + "<if test=\"agencyID != null\">#{agencyID},</if>"
+                        + "<if test=\"marketID != null\">#{marketID},</if>"
+                        + "</trim>"
+                        + "</insert>"
+                        + "</mapper>");
+
+        String previousLimit = System.getProperty("mybatis2sql.maxVariants");
+        System.setProperty("mybatis2sql.maxVariants", "4");
+        try {
+            MybatisXmlToSql.convert(input, output);
+        } finally {
+            if (previousLimit == null) {
+                System.clearProperty("mybatis2sql.maxVariants");
+            } else {
+                System.setProperty("mybatis2sql.maxVariants", previousLimit);
+            }
+        }
+
+        String sql = normalizeNewlines(Files.readAllBytes(output.resolve("AuthorityMapper.sql")));
+        assertTrue(sql.contains("createAuthority (variants: 3)"),
+                "fallback did not generate one variant per unique condition");
+        assertTrue(sql.contains("Enumeration skipped: variant limit 4 exceeded"),
+                "correlated INSERT did not exercise the fallback renderer");
+        assertTrue(countOccurrences(sql, "( participant_id ) VALUES ( '?' )") == 1,
+                "participant fallback column and value were not paired");
+        assertTrue(countOccurrences(sql, "( agency_id ) VALUES ( '?' )") == 1,
+                "agency fallback column and value were not paired");
+        assertTrue(countOccurrences(sql, "( market_id ) VALUES ( '?' )") == 1,
+                "market fallback column and value were not paired");
+    }
+
+    private static void assertSqlLineCommentsRemoved(Path temporaryOutput) throws Exception {
+        Path input = temporaryOutput.resolve("line-comment-input");
+        Path output = temporaryOutput.resolve("line-comment-output");
+        Files.createDirectories(input);
+        writeUtf8(input.resolve("CommentMapper.xml"),
+                "<mapper namespace=\"test.comments\">"
+                        + "<select id=\"findUsers\">\n"
+                        + "SELECT id\n"
+                        + "-- remove before dynamic node\n"
+                        + "<if test=\"includeName\">, name</if>\n"
+                        + "-- remove after dynamic node\n"
+                        + "FROM users\n"
+                        + "WHERE note = '-- literal' -- remove trailing comment\n"
+                        + "AND quoted = \"value--part\"\n"
+                        + "AND ticked = `value--part`\n"
+                        + "/* keep -- block comment */\n"
+                        + "</select>"
+                        + "</mapper>");
+
+        MybatisXmlToSql.convert(input, output);
+
+        String sql = normalizeNewlines(Files.readAllBytes(output.resolve("CommentMapper.sql")));
+        assertTrue(sql.contains("SELECT id FROM users"),
+                "line comment removed SQL from a later line");
+        assertTrue(sql.contains("SELECT id , name FROM users"),
+                "line comment removed a later dynamic node");
+        assertTrue(sql.contains("'-- literal'"),
+                "double dash inside a single-quoted value was removed");
+        assertTrue(sql.contains("\"value--part\""),
+                "double dash inside a double-quoted value was removed");
+        assertTrue(sql.contains("`value--part`"),
+                "double dash inside a backtick-quoted identifier was removed");
+        assertTrue(sql.contains("/* keep -- block comment */"),
+                "block comment was changed while removing line comments");
+        assertTrue(!sql.contains("remove before dynamic node")
+                        && !sql.contains("remove after dynamic node")
+                        && !sql.contains("remove trailing comment"),
+                "source SQL line comment remains in generated output");
     }
 
     private static int countOccurrences(String text, String value) {
