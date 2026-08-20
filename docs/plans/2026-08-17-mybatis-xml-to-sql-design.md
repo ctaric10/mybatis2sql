@@ -47,7 +47,10 @@ paths, so the command does not accept path arguments. The input can be either
 one XML file or a directory. One source XML creates one same-stem `.sql` file.
 Directory input is scanned recursively and relative paths are preserved.
 Duplicate SQL text within one statement is removed. A configurable variant
-limit prevents accidental exponential memory usage.
+limit prevents accidental exponential memory usage. When enumeration would
+exceed the limit, that statement is rendered again in linear mode: static SQL
+forms the baseline and each dynamic condition is emitted independently without
+Cartesian products between conditions.
 
 ## Verification
 

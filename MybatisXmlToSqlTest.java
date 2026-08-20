@@ -28,6 +28,7 @@ public final class MybatisXmlToSqlTest {
                     "cross-directory result contains an unresolved include");
             assertDuplicateFragmentRejected(temporaryOutput);
             assertCyclicIncludeRejected(temporaryOutput);
+            assertVariantLimitFallsBackToIndividualConditions(temporaryOutput);
 
             System.out.println("All MybatisXmlToSql regression tests passed.");
         } finally {
@@ -91,6 +92,59 @@ public final class MybatisXmlToSqlTest {
             assertTrue(expected.getMessage().contains("Cyclic <include>"),
                     "cycle error did not identify the include cycle");
         }
+    }
+
+    private static void assertVariantLimitFallsBackToIndividualConditions(
+            Path temporaryOutput) throws Exception {
+        Path input = temporaryOutput.resolve("variant-limit-input");
+        Path output = temporaryOutput.resolve("variant-limit-output");
+        Files.createDirectories(input);
+        writeUtf8(input.resolve("LimitMapper.xml"),
+                "<mapper namespace=\"test.limit\">"
+                        + "<select id=\"findUsers\">SELECT * FROM users <where>"
+                        + "<if test=\"name != null\">AND name = #{name}</if>"
+                        + "<if test=\"status != null\">AND status = #{status}</if>"
+                        + "<if test=\"type != null\">AND type = #{type}</if>"
+                        + "</where></select>"
+                        + "</mapper>");
+
+        String previousLimit = System.getProperty("mybatis2sql.maxVariants");
+        System.setProperty("mybatis2sql.maxVariants", "4");
+        try {
+            MybatisXmlToSql.convert(input, output);
+        } finally {
+            if (previousLimit == null) {
+                System.clearProperty("mybatis2sql.maxVariants");
+            } else {
+                System.setProperty("mybatis2sql.maxVariants", previousLimit);
+            }
+        }
+
+        String sql = normalizeNewlines(Files.readAllBytes(output.resolve("LimitMapper.sql")));
+        assertTrue(sql.contains("findUsers (variants: 3)"),
+                "over-limit statement did not produce one variant per condition");
+        assertTrue(sql.contains("Enumeration skipped: variant limit 4 exceeded"),
+                "over-limit statement did not report the individual-condition fallback");
+        assertTrue(countOccurrences(sql, "WHERE name = '?'") == 1,
+                "name condition was not emitted exactly once");
+        assertTrue(countOccurrences(sql, "WHERE status = '?'") == 1,
+                "status condition was not emitted exactly once");
+        assertTrue(countOccurrences(sql, "WHERE type = '?'") == 1,
+                "type condition was not emitted exactly once");
+        assertTrue(!sql.contains("name = '?' AND")
+                        && !sql.contains("status = '?' AND")
+                        && !sql.contains("type = '?' AND"),
+                "individual conditions were still combined");
+    }
+
+    private static int countOccurrences(String text, String value) {
+        int count = 0;
+        int start = 0;
+        while ((start = text.indexOf(value, start)) >= 0) {
+            count++;
+            start += value.length();
+        }
+        return count;
     }
 
     private static void writeUtf8(Path path, String text) throws IOException {

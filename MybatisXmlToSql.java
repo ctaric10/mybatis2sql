@@ -36,8 +36,7 @@ import java.util.stream.Stream;
  */
 public final class MybatisXmlToSql {
     /** 防止多个动态标签进行笛卡尔积时产生过多 SQL 变体。 */
-    private static final int MAX_VARIANTS =
-            Integer.getInteger("mybatis2sql.maxVariants", 10_000);
+    private static final int DEFAULT_MAX_VARIANTS = 10_000;
 
     /** 匹配最终仍未被 include property 替换的 #{...} 和 ${...} 占位符。 */
     private static final Pattern MYBATIS_PLACEHOLDER =
@@ -189,7 +188,22 @@ public final class MybatisXmlToSql {
                 continue;
             }
             Element statement = (Element) child;
-            List<Variant> rendered = renderer.renderChildren(statement, Collections.<String, String>emptyMap());
+            List<Variant> rendered;
+            Integer fallbackLimit = null;
+            Map<String, String> noProperties = Collections.<String, String>emptyMap();
+            if (renderer.exceedsVariantLimit(statement, noProperties)) {
+                rendered = renderer.renderChildrenIndividually(
+                        statement, noProperties);
+                fallbackLimit = renderer.maxVariants;
+            } else {
+                try {
+                    rendered = renderer.renderChildren(statement, noProperties);
+                } catch (VariantLimitExceededException exceeded) {
+                    // 计数与渲染逻辑未来扩展后若短暂不一致，仍从语句根节点安全降级。
+                    rendered = renderer.renderChildrenIndividually(statement, noProperties);
+                    fallbackLimit = exceeded.limit;
+                }
+            }
 
             // 不同动态分支可能生成完全相同的 SQL，这里按规范化后的 SQL 去重，
             // LinkedHashMap 同时保证输出顺序稳定。
@@ -200,7 +214,7 @@ public final class MybatisXmlToSql {
                     unique.put(sql, new Variant(sql, variant.decisions));
                 }
             }
-            writeStatement(result, statement, unique);
+            writeStatement(result, statement, unique, fallbackLimit);
             statementCount++;
         }
 
@@ -261,13 +275,18 @@ public final class MybatisXmlToSql {
 
     /** 将一条语句的所有变体及其分支选择信息写成可直接查看的 SQL 文本。 */
     private static void writeStatement(StringBuilder output, Element statement,
-                                       LinkedHashMap<String, Variant> variants) {
+                                       LinkedHashMap<String, Variant> variants,
+                                       Integer fallbackLimit) {
         String type = tagName(statement).toUpperCase(Locale.ROOT);
         String id = statement.getAttribute("id");
         output.append("-- ============================================================\n");
         output.append("-- ").append(type).append(' ').append(id)
                 .append(" (variants: ").append(variants.size()).append(")\n");
         output.append("-- ============================================================\n\n");
+        if (fallbackLimit != null) {
+            output.append("-- Enumeration skipped: variant limit ")
+                    .append(fallbackLimit).append(" exceeded; generated one SQL per condition.\n\n");
+        }
         int number = 1;
         for (Variant variant : variants.values()) {
             String outputSql = replaceMyBatisPlaceholders(variant.text);
@@ -302,6 +321,10 @@ public final class MybatisXmlToSql {
         return MYBATIS_PLACEHOLDER.matcher(sql).replaceAll("'?'");
     }
 
+    private static int configuredMaxVariants() {
+        return Integer.getInteger("mybatis2sql.maxVariants", DEFAULT_MAX_VARIANTS);
+    }
+
     private static String tagName(Element element) {
         String name = element.getTagName();
         int colon = name.indexOf(':');
@@ -315,6 +338,7 @@ public final class MybatisXmlToSql {
     private static final class Renderer {
         private final FragmentRegistry fragments;
         private final String rootNamespace;
+        private final int maxVariants;
 
         /** 保存正在展开的全限定片段 ID，用于检测本地或跨文档循环引用。 */
         private final Deque<String> includeStack = new ArrayDeque<String>();
@@ -325,6 +349,107 @@ public final class MybatisXmlToSql {
         private Renderer(FragmentRegistry fragments, String namespace) {
             this.fragments = fragments;
             this.rootNamespace = namespace;
+            this.maxVariants = configuredMaxVariants();
+        }
+
+        /** 在创建任何变体对象前预判整条语句是否会超过枚举上限。 */
+        private boolean exceedsVariantLimit(Node statement, Map<String, String> properties) {
+            return countChildren(statement, properties) > maxVariants;
+        }
+
+        private long countChildren(Node parent, Map<String, String> properties) {
+            long count = 1L;
+            NodeList children = parent.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                count = cappedMultiply(count, countNode(children.item(i), properties));
+                if (count > maxVariants) {
+                    return count;
+                }
+            }
+            return count;
+        }
+
+        private long countNode(Node node, Map<String, String> properties) {
+            if (!(node instanceof Element)) {
+                return 1L;
+            }
+            Element element = (Element) node;
+            String name = tagName(element).toLowerCase(Locale.ROOT);
+            if ("if".equals(name) || "when".equals(name)) {
+                return cappedAdd(1L, countChildren(element, properties));
+            }
+            if ("choose".equals(name)) {
+                return countChoose(element, properties);
+            }
+            if ("foreach".equals(name)) {
+                long bodies = countChildren(element, properties);
+                return cappedAdd(bodies, cappedMultiply(bodies, bodies));
+            }
+            if ("include".equals(name)) {
+                return countInclude(element, properties);
+            }
+            if ("bind".equals(name)) {
+                return 1L;
+            }
+            return countChildren(element, properties);
+        }
+
+        private long countChoose(Element choose, Map<String, String> properties) {
+            long count = 0L;
+            boolean hasOtherwise = false;
+            NodeList children = choose.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node child = children.item(i);
+                if (!(child instanceof Element)) {
+                    continue;
+                }
+                Element option = (Element) child;
+                String name = tagName(option).toLowerCase(Locale.ROOT);
+                if ("when".equals(name) || "otherwise".equals(name)) {
+                    hasOtherwise = hasOtherwise || "otherwise".equals(name);
+                    count = cappedAdd(count, countChildren(option, properties));
+                    if (count > maxVariants) {
+                        return count;
+                    }
+                }
+            }
+            return hasOtherwise ? count : cappedAdd(count, 1L);
+        }
+
+        private long countInclude(Element include, Map<String, String> properties) {
+            Map<String, String> includeProperties = includeProperties(include, properties);
+            String refid = attr(include, "refid", includeProperties);
+            String activeNamespace = fragmentStack.isEmpty()
+                    ? rootNamespace : fragmentStack.peek().namespace;
+            Fragment fragment = fragments.resolve(refid, activeNamespace);
+            if (fragment == null) {
+                return 1L;
+            }
+            if (includeStack.contains(fragment.qualifiedId)) {
+                throw new IllegalArgumentException("Cyclic <include>: " + includeStack
+                        + " -> " + fragment.qualifiedId);
+            }
+            includeStack.push(fragment.qualifiedId);
+            fragmentStack.push(fragment);
+            try {
+                return countChildren(fragment.element, includeProperties);
+            } finally {
+                fragmentStack.pop();
+                includeStack.pop();
+            }
+        }
+
+        private long cappedAdd(long left, long right) {
+            long cap = (long) maxVariants + 1L;
+            return left >= cap - right ? cap : left + right;
+        }
+
+        private long cappedMultiply(long left, long right) {
+            long cap = (long) maxVariants + 1L;
+            if (left == 0L || right == 0L) {
+                return 0L;
+            }
+            return left >= (cap + right - 1L) / right ? cap : left * right;
         }
 
         /**
@@ -339,6 +464,76 @@ public final class MybatisXmlToSql {
                 result = combine(result, next);
             }
             return result;
+        }
+
+        /**
+         * 超过枚举上限后使用线性模式重新渲染整条语句。基线保存所有条件均不选时的
+         * 静态 SQL，每个 alternative 只替换一个条件分支；顺序节点之间只与对方基线
+         * 合并，因此不同条件不会再形成笛卡尔积。
+         */
+        private List<Variant> renderChildrenIndividually(
+                Node parent, Map<String, String> properties) {
+            IndividualVariants rendered = renderIndividualChildren(parent, properties);
+            if (rendered.alternatives.isEmpty()) {
+                return Collections.singletonList(rendered.baseline);
+            }
+            return rendered.alternatives;
+        }
+
+        private IndividualVariants renderIndividualChildren(
+                Node parent, Map<String, String> properties) {
+            IndividualVariants result = IndividualVariants.baseline(variant(""));
+            NodeList children = parent.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                result = combineIndividually(
+                        result, renderIndividualNode(children.item(i), properties));
+            }
+            return result;
+        }
+
+        private IndividualVariants renderIndividualNode(
+                Node node, Map<String, String> properties) {
+            if (node.getNodeType() == Node.TEXT_NODE || node instanceof CDATASection) {
+                return IndividualVariants.baseline(
+                        variant(substitute(node.getNodeValue(), properties)));
+            }
+            if (!(node instanceof Element)) {
+                return IndividualVariants.baseline(variant(""));
+            }
+
+            Element element = (Element) node;
+            String name = tagName(element).toLowerCase(Locale.ROOT);
+            if ("if".equals(name) || "when".equals(name)) {
+                return renderIfIndividually(element, properties, name);
+            }
+            if ("choose".equals(name)) {
+                return renderChooseIndividually(element, properties);
+            }
+            if ("where".equals(name)) {
+                return wrapTrimIndividually(renderIndividualChildren(element, properties),
+                        "WHERE", "", "AND|OR", "");
+            }
+            if ("set".equals(name)) {
+                return wrapTrimIndividually(renderIndividualChildren(element, properties),
+                        "SET", "", "", ",");
+            }
+            if ("trim".equals(name)) {
+                return wrapTrimIndividually(renderIndividualChildren(element, properties),
+                        attr(element, "prefix", properties),
+                        attr(element, "suffix", properties),
+                        attr(element, "prefixOverrides", properties),
+                        attr(element, "suffixOverrides", properties));
+            }
+            if ("foreach".equals(name)) {
+                return renderForeachIndividually(element, properties);
+            }
+            if ("include".equals(name)) {
+                return renderIncludeIndividually(element, properties);
+            }
+            if ("bind".equals(name)) {
+                return IndividualVariants.baseline(variant(""));
+            }
+            return renderIndividualChildren(element, properties);
         }
 
         /** 根据 MyBatis 动态标签类型分派到相应的渲染方法。 */
@@ -394,6 +589,20 @@ public final class MybatisXmlToSql {
             return result;
         }
 
+        private IndividualVariants renderIfIndividually(
+                Element element, Map<String, String> properties, String label) {
+            String test = attr(element, "test", properties);
+            IndividualVariants body = renderIndividualChildren(element, properties);
+            Variant baseline = new Variant("",
+                    Collections.singletonList(label + "(" + test + ")=false"));
+            List<Variant> alternatives = new ArrayList<Variant>();
+            alternatives.add(body.baseline.withDecision(label + "(" + test + ")=true"));
+            for (Variant alternative : body.alternatives) {
+                alternatives.add(alternative.withDecision(label + "(" + test + ")=true"));
+            }
+            return new IndividualVariants(baseline, alternatives);
+        }
+
         /**
          * 为 choose 的每个 when 以及 otherwise 分别生成结果；
          * 没有 otherwise 时额外保留一个所有条件均不匹配的空分支。
@@ -426,6 +635,35 @@ public final class MybatisXmlToSql {
             }
             checkLimit(result.size());
             return result;
+        }
+
+        private IndividualVariants renderChooseIndividually(
+                Element choose, Map<String, String> properties) {
+            List<Variant> alternatives = new ArrayList<Variant>();
+            NodeList children = choose.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node child = children.item(i);
+                if (!(child instanceof Element)) {
+                    continue;
+                }
+                Element option = (Element) child;
+                String optionName = tagName(option).toLowerCase(Locale.ROOT);
+                String decision;
+                if ("when".equals(optionName)) {
+                    decision = "choose when(" + attr(option, "test", properties) + ")";
+                } else if ("otherwise".equals(optionName)) {
+                    decision = "choose otherwise";
+                } else {
+                    continue;
+                }
+
+                IndividualVariants branch = renderIndividualChildren(option, properties);
+                alternatives.add(branch.baseline.withDecision(decision));
+                for (Variant alternative : branch.alternatives) {
+                    alternatives.add(alternative.withDecision(decision));
+                }
+            }
+            return new IndividualVariants(variant(""), alternatives);
         }
 
         /**
@@ -484,21 +722,63 @@ public final class MybatisXmlToSql {
             return result;
         }
 
+        private IndividualVariants renderForeachIndividually(
+                Element foreach, Map<String, String> properties) {
+            String collection = attr(foreach, "collection", properties);
+            String item = attr(foreach, "item", properties);
+            String index = attr(foreach, "index", properties);
+            String open = attr(foreach, "open", properties);
+            String close = attr(foreach, "close", properties);
+            String separator = attr(foreach, "separator", properties);
+            if (collection.isEmpty()) {
+                collection = "collection";
+            }
+            if (item.isEmpty()) {
+                item = "item";
+            }
+            if (index.isEmpty()) {
+                index = "index";
+            }
+
+            IndividualVariants bodies = renderIndividualChildren(foreach, properties);
+            List<Variant> alternatives = new ArrayList<Variant>();
+            addIndividualForeachVariants(alternatives, bodies.baseline,
+                    collection, item, index, open, close, separator);
+            for (Variant body : bodies.alternatives) {
+                addIndividualForeachVariants(alternatives, body,
+                        collection, item, index, open, close, separator);
+            }
+            return new IndividualVariants(variant(""), alternatives);
+        }
+
+        private static void addIndividualForeachVariants(
+                List<Variant> result, Variant body, String collection,
+                String item, String index, String open, String close, String separator) {
+            String first = replaceLoopVariables(body.text, item, index,
+                    collection + "[0]", "0");
+            result.add(new Variant(join(open, join(first, close)), body.decisions)
+                    .withDecision("foreach(" + collection + ")=one"));
+
+            String second = replaceLoopVariables(body.text, item, index,
+                    collection + "[1]", "1");
+            List<String> decisions = new ArrayList<String>();
+            for (String decision : body.decisions) {
+                decisions.add("item[0] " + decision);
+            }
+            for (String decision : body.decisions) {
+                decisions.add("item[1] " + decision);
+            }
+            String two = joinWithSeparator(first, separator, second);
+            result.add(new Variant(join(open, join(two, close)), decisions)
+                    .withDecision("foreach(" + collection + ")=two"));
+        }
+
         /**
          * 展开 include：先合并 property，再按当前片段所属 namespace 解析 refid。
          * 进入外部片段时将其压栈，从而让片段内部的无前缀 include 使用正确上下文。
          */
         private List<Variant> renderInclude(Element include, Map<String, String> properties) {
-            Map<String, String> includeProperties = new LinkedHashMap<String, String>(properties);
-            NodeList children = include.getChildNodes();
-            for (int i = 0; i < children.getLength(); i++) {
-                Node child = children.item(i);
-                if (child instanceof Element && "property".equalsIgnoreCase(tagName((Element) child))) {
-                    Element property = (Element) child;
-                    includeProperties.put(property.getAttribute("name"),
-                            substitute(property.getAttribute("value"), includeProperties));
-                }
-            }
+            Map<String, String> includeProperties = includeProperties(include, properties);
             String refid = attr(include, "refid", includeProperties);
 
             // 语句直接引用时使用当前 Mapper namespace；嵌套引用时使用外部片段 namespace。
@@ -524,6 +804,47 @@ public final class MybatisXmlToSql {
             }
         }
 
+        private IndividualVariants renderIncludeIndividually(
+                Element include, Map<String, String> properties) {
+            Map<String, String> includeProperties = includeProperties(include, properties);
+            String refid = attr(include, "refid", includeProperties);
+            String activeNamespace = fragmentStack.isEmpty()
+                    ? rootNamespace : fragmentStack.peek().namespace;
+            Fragment fragment = fragments.resolve(refid, activeNamespace);
+            if (fragment == null) {
+                return IndividualVariants.baseline(
+                        variant("/* unresolved include: " + safeComment(refid) + " */"));
+            }
+            if (includeStack.contains(fragment.qualifiedId)) {
+                throw new IllegalArgumentException("Cyclic <include>: " + includeStack
+                        + " -> " + fragment.qualifiedId);
+            }
+            includeStack.push(fragment.qualifiedId);
+            fragmentStack.push(fragment);
+            try {
+                return renderIndividualChildren(fragment.element, includeProperties);
+            } finally {
+                fragmentStack.pop();
+                includeStack.pop();
+            }
+        }
+
+        private static Map<String, String> includeProperties(
+                Element include, Map<String, String> properties) {
+            Map<String, String> result = new LinkedHashMap<String, String>(properties);
+            NodeList children = include.getChildNodes();
+            for (int i = 0; i < children.getLength(); i++) {
+                Node child = children.item(i);
+                if (child instanceof Element
+                        && "property".equalsIgnoreCase(tagName((Element) child))) {
+                    Element property = (Element) child;
+                    result.put(property.getAttribute("name"),
+                            substitute(property.getAttribute("value"), result));
+                }
+            }
+            return result;
+        }
+
         /** 实现 where、set 和 trim 共用的前后缀添加及覆盖词移除规则。 */
         private static List<Variant> wrapTrim(List<Variant> variants, String prefix, String suffix,
                                               String prefixOverrides, String suffixOverrides) {
@@ -538,6 +859,31 @@ public final class MybatisXmlToSql {
                 result.add(new Variant(text, variant.decisions));
             }
             return result;
+        }
+
+        private static IndividualVariants wrapTrimIndividually(
+                IndividualVariants variants, String prefix, String suffix,
+                String prefixOverrides, String suffixOverrides) {
+            Variant baseline = wrapTrimVariant(
+                    variants.baseline, prefix, suffix, prefixOverrides, suffixOverrides);
+            List<Variant> alternatives = new ArrayList<Variant>();
+            for (Variant alternative : variants.alternatives) {
+                alternatives.add(wrapTrimVariant(
+                        alternative, prefix, suffix, prefixOverrides, suffixOverrides));
+            }
+            return new IndividualVariants(baseline, alternatives);
+        }
+
+        private static Variant wrapTrimVariant(
+                Variant variant, String prefix, String suffix,
+                String prefixOverrides, String suffixOverrides) {
+            String text = normalizeSql(variant.text);
+            text = removePrefix(text, prefixOverrides);
+            text = removeSuffix(text, suffixOverrides);
+            if (!text.isEmpty()) {
+                text = join(prefix, join(text, suffix));
+            }
+            return new Variant(text, variant.decisions);
         }
 
         private static String removePrefix(String text, String overrides) {
@@ -629,7 +975,7 @@ public final class MybatisXmlToSql {
         /**
          * 将相邻节点的变体做笛卡尔积，并合并两侧的 SQL 文本和分支说明。
          */
-        private static List<Variant> combine(List<Variant> left, List<Variant> right) {
+        private List<Variant> combine(List<Variant> left, List<Variant> right) {
             long size = (long) left.size() * (long) right.size();
             checkLimit(size);
             List<Variant> result = new ArrayList<Variant>((int) size);
@@ -645,15 +991,40 @@ public final class MybatisXmlToSql {
             return result;
         }
 
+        private static IndividualVariants combineIndividually(
+                IndividualVariants left, IndividualVariants right) {
+            Variant baseline = combineVariants(left.baseline, right.baseline);
+            List<Variant> alternatives = new ArrayList<Variant>(
+                    left.alternatives.size() + right.alternatives.size());
+            for (Variant alternative : left.alternatives) {
+                alternatives.add(combineVariants(alternative, right.baseline));
+            }
+            for (Variant alternative : right.alternatives) {
+                alternatives.add(combineVariants(left.baseline, alternative));
+            }
+            return new IndividualVariants(baseline, alternatives);
+        }
+
+        private static Variant combineVariants(Variant first, Variant second) {
+            List<String> decisions = new ArrayList<String>(
+                    first.decisions.size() + second.decisions.size());
+            decisions.addAll(first.decisions);
+            decisions.addAll(second.decisions);
+            return new Variant(join(first.text, second.text), decisions);
+        }
+
+        private static Variant variant(String text) {
+            return new Variant(text, Collections.<String>emptyList());
+        }
+
         private static List<Variant> singleton(String text) {
             return Collections.singletonList(new Variant(text, Collections.<String>emptyList()));
         }
 
         /** 在真正分配集合前检查上限，避免动态分支爆炸耗尽内存。 */
-        private static void checkLimit(long size) {
-            if (size > MAX_VARIANTS) {
-                throw new IllegalStateException("Dynamic SQL produced more than " + MAX_VARIANTS
-                        + " variants. Increase with -Dmybatis2sql.maxVariants=<number> if intentional.");
+        private void checkLimit(long size) {
+            if (size > maxVariants) {
+                throw new VariantLimitExceededException(maxVariants);
             }
         }
 
@@ -747,6 +1118,33 @@ public final class MybatisXmlToSql {
             this.path = path;
             this.mapper = mapper;
             this.namespace = namespace == null ? "" : namespace;
+        }
+    }
+
+    /** 超限后线性渲染所需的基线 SQL 与单条件分支。 */
+    private static final class IndividualVariants {
+        private final Variant baseline;
+        private final List<Variant> alternatives;
+
+        private IndividualVariants(Variant baseline, List<Variant> alternatives) {
+            this.baseline = baseline;
+            this.alternatives = Collections.unmodifiableList(
+                    new ArrayList<Variant>(alternatives));
+        }
+
+        private static IndividualVariants baseline(Variant baseline) {
+            return new IndividualVariants(baseline, Collections.<Variant>emptyList());
+        }
+    }
+
+    /** 只用于从普通枚举切换到单条件渲染，避免吞掉其他渲染错误。 */
+    private static final class VariantLimitExceededException extends IllegalStateException {
+        private static final long serialVersionUID = 1L;
+        private final int limit;
+
+        private VariantLimitExceededException(int limit) {
+            super("Dynamic SQL produced more than " + limit + " variants");
+            this.limit = limit;
         }
     }
 
